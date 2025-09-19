@@ -1,8 +1,9 @@
 import asyncio
+import copy
 import functools
 import time
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from litellm._logging import verbose_logger
 from litellm.types.utils import (
@@ -275,3 +276,117 @@ def track_llm_api_timing():
         return sync_wrapper
 
     return decorator
+
+
+class StreamingAccumulator:
+    """Accumulates streaming chunks for logging helpers."""
+
+    def __init__(self) -> None:
+        self._streaming_chunks: List[Dict[str, Any]] = []
+        self._chunk_hidden_params: List[Optional[dict]] = []
+        self._chunk_response_headers: List[Optional[dict]] = []
+        self._audio_chunks: List[str] = []
+        self._audio_transcripts: List[str] = []
+        self._audio_expires_at: Optional[int] = None
+        self._audio_id: Optional[str] = None
+
+    def add_chunk(
+        self, chunk: Union[ModelResponseStream, Dict[str, Any]]
+    ) -> None:
+        """Store a streaming chunk and extract any audio deltas."""
+
+        if isinstance(chunk, ModelResponseStream):
+            chunk_dict = chunk.model_dump()
+            self._chunk_hidden_params.append(getattr(chunk, "_hidden_params", None))
+            self._chunk_response_headers.append(
+                getattr(chunk, "_response_headers", None)
+            )
+        else:
+            chunk_dict = copy.deepcopy(chunk)
+            self._chunk_hidden_params.append(None)
+            self._chunk_response_headers.append(None)
+
+        self._streaming_chunks.append(chunk_dict)
+
+        for choice in chunk_dict.get("choices", []):
+            delta = choice.get("delta") or {}
+            audio = delta.get("audio")
+            if isinstance(audio, dict):
+                data = audio.get("data")
+                if isinstance(data, str):
+                    self._audio_chunks.append(data)
+
+                transcript = audio.get("transcript")
+                if isinstance(transcript, str):
+                    self._audio_transcripts.append(transcript)
+
+                expires_at = audio.get("expires_at")
+                if isinstance(expires_at, int):
+                    self._audio_expires_at = expires_at
+
+                audio_id = audio.get("id")
+                if isinstance(audio_id, str):
+                    self._audio_id = audio_id
+
+    def _build_stream_chunk(self) -> Optional[ModelResponseStream]:
+        """Build a consolidated streaming chunk from accumulated chunks."""
+
+        if not self._streaming_chunks:
+            return None
+
+        chunk_dict = copy.deepcopy(self._streaming_chunks[-1])
+
+        audio_payload: Dict[str, Any] = {}
+
+        if self._audio_chunks:
+            import base64
+            import binascii
+
+            decoded_segments: List[bytes] = []
+            for value in self._audio_chunks:
+                if not isinstance(value, str):
+                    continue
+                try:
+                    decoded_segments.append(base64.b64decode(value))
+                except (binascii.Error, ValueError) as exc:
+                    verbose_logger.debug(
+                        "Ignoring invalid base64 audio segment while building stream chunk: %s",
+                        exc,
+                    )
+
+            if decoded_segments:
+                audio_payload["data"] = base64.b64encode(b"".join(decoded_segments)).decode(
+                    "utf-8"
+                )
+
+        if self._audio_transcripts:
+            audio_payload["transcript"] = "".join(self._audio_transcripts)
+
+        if self._audio_expires_at is not None:
+            audio_payload["expires_at"] = self._audio_expires_at
+
+        if self._audio_id is not None:
+            audio_payload["id"] = self._audio_id
+
+        if audio_payload:
+            for choice in chunk_dict.get("choices", []):
+                delta = choice.get("delta")
+                if delta is None:
+                    delta = {}
+                    choice["delta"] = delta
+                delta["audio"] = audio_payload
+
+        try:
+            built_chunk = ModelResponseStream(**chunk_dict)
+            hidden_params = self._chunk_hidden_params[-1]
+            if hidden_params is not None:
+                built_chunk._hidden_params = hidden_params
+            response_headers = self._chunk_response_headers[-1]
+            if response_headers is not None:
+                built_chunk._response_headers = response_headers
+            return built_chunk
+        except Exception:
+            verbose_logger.exception(
+                "Unable to construct ModelResponseStream from accumulated data"
+            )
+            return None
