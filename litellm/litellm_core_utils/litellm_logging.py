@@ -63,6 +63,7 @@ from litellm.litellm_core_utils.get_litellm_params import get_litellm_params
 from litellm.litellm_core_utils.llm_cost_calc.tool_call_cost_tracking import (
     StandardBuiltInToolCostTracking,
 )
+from litellm.litellm_core_utils.streaming_accumulator import StreamingAccumulator
 from litellm.litellm_core_utils.model_param_helper import ModelParamHelper
 from litellm.litellm_core_utils.redact_messages import (
     redact_message_input_output_from_custom_logger,
@@ -299,10 +300,10 @@ class Logging(LiteLLMLoggingBaseClass):
         self.litellm_call_id = litellm_call_id
         self.litellm_trace_id: str = litellm_trace_id or str(uuid.uuid4())
         self.function_id = function_id
-        self.streaming_chunks: List[Any] = []  # for generating complete stream response
-        self.sync_streaming_chunks: List[
-            Any
-        ] = []  # for generating complete stream response
+        self.streaming_accumulator = StreamingAccumulator(messages=self.messages)
+        self.sync_streaming_accumulator = StreamingAccumulator(messages=self.messages)
+        self.streaming_chunks = self.streaming_accumulator
+        self.sync_streaming_chunks = self.sync_streaming_accumulator
         self.log_raw_request_response = log_raw_request_response
 
         # Initialize dynamic callbacks
@@ -1642,7 +1643,7 @@ class Logging(LiteLLMLoggingBaseClass):
                 start_time=start_time,
                 end_time=end_time,
                 is_async=False,
-                streaming_chunks=self.sync_streaming_chunks,
+                accumulator=self.sync_streaming_accumulator,
             )
             if complete_streaming_response is not None:
                 verbose_logger.debug(
@@ -2169,7 +2170,7 @@ class Logging(LiteLLMLoggingBaseClass):
             start_time=start_time,
             end_time=end_time,
             is_async=True,
-            streaming_chunks=self.streaming_chunks,
+            accumulator=self.streaming_accumulator,
         )
 
         if complete_streaming_response is not None:
@@ -2920,15 +2921,26 @@ class Logging(LiteLLMLoggingBaseClass):
         start_time: datetime.datetime,
         end_time: datetime.datetime,
         is_async: bool,
-        streaming_chunks: List[Any],
+        accumulator: StreamingAccumulator,
     ) -> Optional[Union[ModelResponse, TextCompletionResponse, ResponsesAPIResponse]]:
         if isinstance(result, ModelResponse):
+            accumulator.clear()
             return result
         elif isinstance(result, TextCompletionResponse):
+            accumulator.clear()
             return result
         elif isinstance(result, ResponseCompletedEvent):
+            accumulator.clear()
             return result.response
         else:
+            if accumulator.has_data():
+                response = accumulator.finalize(
+                    messages=self.messages,
+                    start_time=start_time,
+                    end_time=end_time,
+                    logging_obj=self,
+                )
+                return response
             return None
         return None
 

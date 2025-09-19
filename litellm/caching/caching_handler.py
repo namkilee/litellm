@@ -39,6 +39,7 @@ from litellm.caching.caching import S3Cache
 from litellm.litellm_core_utils.logging_utils import (
     _assemble_complete_response_from_streaming_chunks,
 )
+from litellm.litellm_core_utils.streaming_accumulator import StreamingAccumulator
 from litellm.types.caching import CachedEmbedding
 from litellm.types.rerank import RerankResponse
 from litellm.types.utils import (
@@ -85,8 +86,12 @@ class LLMCachingHandler:
     ):
         from litellm.caching import DualCache, RedisCache
 
-        self.async_streaming_chunks: List[ModelResponse] = []
-        self.sync_streaming_chunks: List[ModelResponse] = []
+        self.async_streaming_accumulator = StreamingAccumulator(
+            messages=request_kwargs.get("messages")
+        )
+        self.sync_streaming_accumulator = StreamingAccumulator(
+            messages=request_kwargs.get("messages")
+        )
         self.request_kwargs = request_kwargs
         self.original_function = original_function
         self.start_time = start_time
@@ -895,6 +900,9 @@ class LLMCachingHandler:
 
         """
 
+        self.async_streaming_accumulator.messages = self.request_kwargs.get(
+            "messages"
+        )
         complete_streaming_response: Optional[
             Union[ModelResponse, TextCompletionResponse]
         ] = _assemble_complete_response_from_streaming_chunks(
@@ -902,7 +910,7 @@ class LLMCachingHandler:
             start_time=self.start_time,
             end_time=datetime.datetime.now(),
             request_kwargs=self.request_kwargs,
-            streaming_chunks=self.async_streaming_chunks,
+            accumulator=self.async_streaming_accumulator,
             is_async=True,
         )
         # if a complete_streaming_response is assembled, add it to the cache
@@ -917,6 +925,7 @@ class LLMCachingHandler:
         """
         Sync internal method to add the streaming response to the cache
         """
+        self.sync_streaming_accumulator.messages = self.request_kwargs.get("messages")
         complete_streaming_response: Optional[
             Union[ModelResponse, TextCompletionResponse]
         ] = _assemble_complete_response_from_streaming_chunks(
@@ -924,7 +933,7 @@ class LLMCachingHandler:
             start_time=self.start_time,
             end_time=datetime.datetime.now(),
             request_kwargs=self.request_kwargs,
-            streaming_chunks=self.sync_streaming_chunks,
+            accumulator=self.sync_streaming_accumulator,
             is_async=False,
         )
 

@@ -21,6 +21,8 @@ sys.path.insert(
 
 import httpx
 import pytest
+
+pytest.importorskip("respx")
 from respx import MockRouter
 
 import litellm
@@ -36,6 +38,7 @@ from litellm import (
 from litellm.litellm_core_utils.logging_utils import (
     _assemble_complete_response_from_streaming_chunks,
 )
+from litellm.litellm_core_utils.streaming_accumulator import StreamingAccumulator
 
 
 @pytest.mark.parametrize("is_async", [True, False])
@@ -49,7 +52,7 @@ def test_assemble_complete_response_from_streaming_chunks_1(is_async):
         "messages": [{"role": "user", "content": "Hello, world!"}],
     }
 
-    list_streaming_chunks = []
+    accumulator = StreamingAccumulator(messages=request_kwargs["messages"])
     chunk = {
         "id": "chatcmpl-9mWtyDnikZZoB75DyfUzWUxiiE2Pi",
         "choices": [
@@ -76,17 +79,16 @@ def test_assemble_complete_response_from_streaming_chunks_1(is_async):
         start_time=datetime.now(),
         end_time=datetime.now(),
         request_kwargs=request_kwargs,
-        streaming_chunks=list_streaming_chunks,
+        accumulator=accumulator,
         is_async=is_async,
     )
 
     # this is the 1st chunk - complete_streaming_response should be None
 
-    print("list_streaming_chunks", list_streaming_chunks)
     print("complete_streaming_response", complete_streaming_response)
     assert complete_streaming_response is None
-    assert len(list_streaming_chunks) == 1
-    assert list_streaming_chunks[0] == chunk
+    assert accumulator.has_data() is True
+    assert accumulator.get_accumulated_content() == "hello in response"
 
     # Add final chunk
     chunk = {
@@ -116,19 +118,19 @@ def test_assemble_complete_response_from_streaming_chunks_1(is_async):
         start_time=datetime.now(),
         end_time=datetime.now(),
         request_kwargs=request_kwargs,
-        streaming_chunks=list_streaming_chunks,
+        accumulator=accumulator,
         is_async=is_async,
     )
 
-    print("list_streaming_chunks", list_streaming_chunks)
     print("complete_streaming_response", complete_streaming_response)
 
     # this is the 2nd chunk - complete_streaming_response should not be None
     assert complete_streaming_response is not None
-    assert len(list_streaming_chunks) == 2
 
     assert isinstance(complete_streaming_response, ModelResponse)
     assert isinstance(complete_streaming_response.choices[0], Choices)
+    assert accumulator.has_data() is False
+    assert accumulator.get_accumulated_content() == ""
 
     pass
 
@@ -150,7 +152,7 @@ def test_assemble_complete_response_from_streaming_chunks_2(is_async):
         "messages": [{"role": "user", "content": "Hello, world!"}],
     }
 
-    list_streaming_chunks = []
+    accumulator = StreamingAccumulator(messages=request_kwargs["messages"])
     chunk = {
         "id": "chatcmpl-9mWtyDnikZZoB75DyfUzWUxiiE2Pi",
         "choices": [
@@ -179,17 +181,15 @@ def test_assemble_complete_response_from_streaming_chunks_2(is_async):
         start_time=datetime.now(),
         end_time=datetime.now(),
         request_kwargs=request_kwargs,
-        streaming_chunks=list_streaming_chunks,
+        accumulator=accumulator,
         is_async=is_async,
     )
 
     # this is the 1st chunk - complete_streaming_response should be None
 
-    print("list_streaming_chunks", list_streaming_chunks)
     print("complete_streaming_response", complete_streaming_response)
     assert complete_streaming_response is None
-    assert len(list_streaming_chunks) == 1
-    assert list_streaming_chunks[0] == chunk
+    assert accumulator.has_data() is True
 
     # Add final chunk
     chunk = {
@@ -220,19 +220,18 @@ def test_assemble_complete_response_from_streaming_chunks_2(is_async):
         start_time=datetime.now(),
         end_time=datetime.now(),
         request_kwargs=request_kwargs,
-        streaming_chunks=list_streaming_chunks,
+        accumulator=accumulator,
         is_async=is_async,
     )
 
-    print("list_streaming_chunks", list_streaming_chunks)
     print("complete_streaming_response", complete_streaming_response)
 
     # this is the 2nd chunk - complete_streaming_response should not be None
     assert complete_streaming_response is not None
-    assert len(list_streaming_chunks) == 2
 
     assert isinstance(complete_streaming_response, TextCompletionResponse)
     assert isinstance(complete_streaming_response.choices[0], TextChoices)
+    assert accumulator.has_data() is False
 
     pass
 
@@ -245,8 +244,8 @@ def test_assemble_complete_response_from_streaming_chunks_3(is_async):
         "messages": [{"role": "user", "content": "Hello, world!"}],
     }
 
-    list_streaming_chunks_1 = []
-    list_streaming_chunks_2 = []
+    accumulator_1 = StreamingAccumulator(messages=request_kwargs["messages"])
+    accumulator_2 = StreamingAccumulator(messages=request_kwargs["messages"])
 
     chunk = {
         "id": "chatcmpl-9mWtyDnikZZoB75DyfUzWUxiiE2Pi",
@@ -274,18 +273,16 @@ def test_assemble_complete_response_from_streaming_chunks_3(is_async):
         start_time=datetime.now(),
         end_time=datetime.now(),
         request_kwargs=request_kwargs,
-        streaming_chunks=list_streaming_chunks_1,
+        accumulator=accumulator_1,
         is_async=is_async,
     )
 
     # this is the 1st chunk - complete_streaming_response should be None
 
-    print("list_streaming_chunks_1", list_streaming_chunks_1)
     print("complete_streaming_response", complete_streaming_response)
     assert complete_streaming_response is None
-    assert len(list_streaming_chunks_1) == 1
-    assert list_streaming_chunks_1[0] == chunk
-    assert len(list_streaming_chunks_2) == 0
+    assert accumulator_1.has_data() is True
+    assert accumulator_2.has_data() is False
 
     # now add a chunk to the 2nd list
 
@@ -294,18 +291,50 @@ def test_assemble_complete_response_from_streaming_chunks_3(is_async):
         start_time=datetime.now(),
         end_time=datetime.now(),
         request_kwargs=request_kwargs,
-        streaming_chunks=list_streaming_chunks_2,
+        accumulator=accumulator_2,
         is_async=is_async,
     )
 
-    print("list_streaming_chunks_2", list_streaming_chunks_2)
     print("complete_streaming_response", complete_streaming_response)
     assert complete_streaming_response is None
-    assert len(list_streaming_chunks_2) == 1
-    assert list_streaming_chunks_2[0] == chunk
-    assert len(list_streaming_chunks_1) == 1
+    assert accumulator_2.has_data() is True
+    assert accumulator_1.has_data() is True
 
-    # now add a chunk to the 1st list
+    # finalize the first accumulator with a stop chunk
+    final_chunk = ModelResponseStream(
+        **{
+            "id": "chatcmpl-9mWtyDnikZZoB75DyfUzWUxiiE2Pi",
+            "choices": [
+                litellm.utils.StreamingChoices(
+                    finish_reason="stop",
+                    delta=litellm.utils.Delta(
+                        content="end",
+                        function_call=None,
+                        role=None,
+                        tool_calls=None,
+                    ),
+                )
+            ],
+            "created": 1721353246,
+            "model": "gpt-3.5-turbo",
+            "object": "chat.completion.chunk",
+            "system_fingerprint": None,
+            "usage": None,
+        }
+    )
+
+    complete_streaming_response = _assemble_complete_response_from_streaming_chunks(
+        result=final_chunk,
+        start_time=datetime.now(),
+        end_time=datetime.now(),
+        request_kwargs=request_kwargs,
+        accumulator=accumulator_1,
+        is_async=is_async,
+    )
+
+    assert complete_streaming_response is not None
+    assert accumulator_1.has_data() is False
+    assert accumulator_2.has_data() is True
 
 
 @pytest.mark.parametrize("is_async", [True, False])
@@ -314,7 +343,7 @@ def test_assemble_complete_response_from_streaming_chunks_4(is_async):
     Test 4 - build a complete response when 1 chunk is poorly formatted
 
     - Assert complete_streaming_response is None
-    - Assert list_streaming_chunks is not empty
+    - Assert accumulator retains the chunk information
     """
 
     request_kwargs = {
@@ -322,7 +351,7 @@ def test_assemble_complete_response_from_streaming_chunks_4(is_async):
         "messages": [{"role": "user", "content": "Hello, world!"}],
     }
 
-    list_streaming_chunks = []
+    accumulator = StreamingAccumulator(messages=request_kwargs["messages"])
 
     chunk = {
         "id": "chatcmpl-9mWtyDnikZZoB75DyfUzWUxiiE2Pi",
@@ -355,13 +384,11 @@ def test_assemble_complete_response_from_streaming_chunks_4(is_async):
         start_time=datetime.now(),
         end_time=datetime.now(),
         request_kwargs=request_kwargs,
-        streaming_chunks=list_streaming_chunks,
+        accumulator=accumulator,
         is_async=is_async,
     )
 
     print("complete_streaming_response", complete_streaming_response)
     assert complete_streaming_response is None
 
-    print("list_streaming_chunks", list_streaming_chunks)
-
-    assert len(list_streaming_chunks) == 1
+    assert accumulator.has_data() is True
