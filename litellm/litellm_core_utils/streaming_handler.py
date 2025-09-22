@@ -1,5 +1,6 @@
 import asyncio
 import collections.abc
+from collections import deque
 import datetime
 import json
 import threading
@@ -16,6 +17,7 @@ from litellm import verbose_logger
 from litellm.litellm_core_utils.model_response_utils import (
     is_model_response_stream_empty,
 )
+from litellm.litellm_core_utils.streaming_accumulator import StreamingAccumulator
 from litellm.litellm_core_utils.redact_messages import LiteLLMLoggingObject
 from litellm.litellm_core_utils.thread_pool_executor import executor
 from litellm.types.llms.openai import ChatCompletionChunk
@@ -107,8 +109,7 @@ class CustomStreamWrapper:
             "<|im_start|>",
         ]
         self.holding_chunk = ""
-        self.complete_response = ""
-        self.response_uptil_now = ""
+        self.complete_response: Optional[str] = None
         _model_info: Dict = litellm_params.model_info or {}
 
         _api_base = get_api_base(
@@ -140,9 +141,13 @@ class CustomStreamWrapper:
             True if self.check_send_stream_usage(self.stream_options) else False
         )
         self.tool_call = False
-        self.chunks: List = (
-            []
-        )  # keep track of the returned chunks - used for calculating the input/output tokens for stream options
+        self.accumulator = StreamingAccumulator(messages=self.messages)
+        self._recent_contents: deque[str] = deque(
+            maxlen=litellm.REPEATED_STREAMING_CHUNK_LIMIT
+        )
+        self._background_futures = set()
+        self._background_tasks = set()
+        self._background_lock = threading.Lock()
         self.is_function_call = self.check_is_function_call(logging_obj=logging_obj)
         self.created: Optional[int] = None
 
@@ -176,6 +181,8 @@ class CustomStreamWrapper:
         NLP Cloud streaming returns the entire response, for each chunk. Process this, to only return the delta.
         """
         try:
+            if self.complete_response is None:
+                self.complete_response = ""
             chunk = chunk.strip()
             self.complete_response = self.complete_response.strip()
 
@@ -196,28 +203,24 @@ class CustomStreamWrapper:
 
         Raises - InternalServerError, if LLM enters infinite loop while streaming
         """
-        if len(self.chunks) >= litellm.REPEATED_STREAMING_CHUNK_LIMIT:
-            # Get the last n chunks
-            last_chunks = self.chunks[-litellm.REPEATED_STREAMING_CHUNK_LIMIT :]
+        limit = litellm.REPEATED_STREAMING_CHUNK_LIMIT
+        if limit <= 0:
+            return
+        if len(self._recent_contents) < limit:
+            return
 
-            # Extract the relevant content from the chunks
-            last_contents = [chunk.choices[0].delta.content for chunk in last_chunks]
-
-            # Check if all extracted contents are identical
-            if all(content == last_contents[0] for content in last_contents):
-                if (
-                    last_contents[0] is not None
-                    and isinstance(last_contents[0], str)
-                    and len(last_contents[0]) > 2
-                ):  # ignore empty content - https://github.com/BerriAI/litellm/issues/5158#issuecomment-2287156946
-                    # All last n chunks are identical
-                    raise litellm.InternalServerError(
-                        message="The model is repeating the same chunk = {}.".format(
-                            last_contents[0]
-                        ),
-                        model="",
-                        llm_provider="",
-                    )
+        first = self._recent_contents[0]
+        if (
+            first
+            and isinstance(first, str)
+            and len(first) > 2
+            and all(content == first for content in self._recent_contents)
+        ):
+            raise litellm.InternalServerError(
+                message="The model is repeating the same chunk = {}.".format(first),
+                model="",
+                llm_provider="",
+            )
 
     def check_special_tokens(self, chunk: str, finish_reason: Optional[str]):
         """
@@ -818,6 +821,45 @@ class CustomStreamWrapper:
         """
         return delta is not None and getattr(delta, attribute_name, None) is not None
 
+    def _register_recent_content(self, model_response: "ModelResponseStream") -> None:
+        if litellm.REPEATED_STREAMING_CHUNK_LIMIT <= 0:
+            return
+        if not model_response or not getattr(model_response, "choices", None):
+            return
+        choice = model_response.choices[0]
+        delta = getattr(choice, "delta", None)
+        if delta is None:
+            return
+        content = getattr(delta, "content", None)
+        if isinstance(content, str) and len(content) > 0:
+            self._recent_contents.append(content)
+            self.safety_checker()
+
+    def _track_future(self, future) -> None:
+        if future is None:
+            return
+        try:
+            with self._background_lock:
+                self._background_futures.add(future)
+
+            def _cleanup(fut):
+                with self._background_lock:
+                    self._background_futures.discard(fut)
+
+            future.add_done_callback(_cleanup)
+        except Exception:
+            pass
+
+    def _track_task(self, task: "asyncio.Task[Any]") -> None:
+        if task is None:
+            return
+        self._background_tasks.add(task)
+
+        def _cleanup(_: "asyncio.Task[Any]") -> None:
+            self._background_tasks.discard(task)
+
+        task.add_done_callback(_cleanup)
+
     def _copy_delta_attribute(
         self, source_delta, target_delta, attribute_name: str
     ) -> None:
@@ -869,7 +911,6 @@ class CustomStreamWrapper:
         if (
             is_chunk_non_empty
         ):  # cannot set content of an OpenAI Object to be an empty string
-            self.safety_checker()
             hold, model_response_str = self.check_special_tokens(
                 chunk=completion_obj["content"],
                 finish_reason=model_response.choices[0].finish_reason,
@@ -934,6 +975,7 @@ class CustomStreamWrapper:
                     model_response=model_response
                 )
 
+                self._register_recent_content(model_response)
                 return model_response
             else:
                 return
@@ -941,11 +983,12 @@ class CustomStreamWrapper:
             if self.sent_last_chunk is True:
                 # Bedrock returns the guardrail trace in the last chunk - we want to return this here
                 if self.custom_llm_provider == "bedrock" and "trace" in model_response:
+                    self._register_recent_content(model_response)
                     return model_response
 
                 # Default - return StopIteration
                 if hasattr(model_response, "usage"):
-                    self.chunks.append(model_response)
+                    self.accumulator.update(model_response)
                 raise StopIteration
             # flush any remaining holding chunk
             if len(self.holding_chunk) > 0:
@@ -970,12 +1013,15 @@ class CustomStreamWrapper:
 
                 self.sent_last_chunk = True
 
+            self._register_recent_content(model_response)
             return model_response
         elif self._has_special_delta_content(model_response):
+            self._register_recent_content(model_response)
             return self._handle_special_delta_content(model_response)
         else:
             if hasattr(model_response, "usage"):
-                self.chunks.append(model_response)
+                self.accumulator.update(model_response)
+            self._register_recent_content(model_response)
             return
 
     def _optional_combine_thinking_block_in_choices(
@@ -1618,22 +1664,17 @@ class CustomStreamWrapper:
                         self.logging_obj._update_completion_start_time(
                             completion_start_time=datetime.datetime.now()
                         )
-                    ## LOGGING
-                    executor.submit(
+                    self.accumulator.update(response)
+                    aggregated_content = self.accumulator.get_accumulated_content()
+                    self.rules.post_call_rules(
+                        input=aggregated_content or None, model=self.model
+                    )
+                    future = executor.submit(
                         self.run_success_logging_and_cache_storage,
                         response,
                         cache_hit,
-                    )  # log response
-                    choice = response.choices[0]
-                    if isinstance(choice, StreamingChoices):
-                        self.response_uptil_now += choice.delta.get("content", "") or ""
-                    else:
-                        self.response_uptil_now += ""
-                    self.rules.post_call_rules(
-                        input=self.response_uptil_now, model=self.model
                     )
-                    # HANDLE STREAM OPTIONS
-                    self.chunks.append(response)
+                    self._track_future(future)
                     if hasattr(
                         response, "usage"
                     ):  # remove usage from chunk, only send on final chunk
@@ -1657,19 +1698,18 @@ class CustomStreamWrapper:
                             continue
                     # add usage as hidden param
                     if self.sent_last_chunk is True and self.stream_options is None:
-                        usage = calculate_total_usage(chunks=self.chunks)
-                        response._hidden_params["usage"] = usage
+                        usage = self.accumulator.current_usage()
+                        if usage is not None:
+                            response._hidden_params["usage"] = usage
                     # RETURN RESULT
                     return response
 
         except StopIteration:
             if self.sent_last_chunk is True:
-                complete_streaming_response = litellm.stream_chunk_builder(
-                    chunks=self.chunks,
+                complete_streaming_response = self.accumulator.finalize(
                     messages=self.messages,
                     logging_obj=self.logging_obj,
                 )
-
                 response = self.model_response_creator()
                 if complete_streaming_response is not None:
                     setattr(
@@ -1678,26 +1718,27 @@ class CustomStreamWrapper:
                         getattr(complete_streaming_response, "usage"),
                     )
                     self.cache_streaming_response(
-                        processed_chunk=complete_streaming_response.model_copy(
-                            deep=True
-                        ),
+                        processed_chunk=complete_streaming_response,
                         cache_hit=cache_hit,
                     )
-                    executor.submit(
+                    future = executor.submit(
                         self.logging_obj.success_handler,
-                        complete_streaming_response.model_copy(deep=True),
+                        complete_streaming_response,
                         None,
                         None,
                         cache_hit,
                     )
+                    self._track_future(future)
                 else:
-                    executor.submit(
+                    future = executor.submit(
                         self.logging_obj.success_handler,
                         response,
                         None,
                         None,
                         cache_hit,
                     )
+                    self._track_future(future)
+                self._recent_contents.clear()
                 if self.sent_stream_usage is False and self.send_stream_usage is True:
                     self.sent_stream_usage = True
                     return response
@@ -1705,15 +1746,18 @@ class CustomStreamWrapper:
             else:
                 self.sent_last_chunk = True
                 processed_chunk = self.finish_reason_handler()
+                self.accumulator.update(processed_chunk)
                 if self.stream_options is None:  # add usage as hidden param
-                    usage = calculate_total_usage(chunks=self.chunks)
-                    processed_chunk._hidden_params["usage"] = usage
-                ## LOGGING
-                executor.submit(
+                    usage = self.accumulator.current_usage()
+                    if usage is not None:
+                        processed_chunk._hidden_params["usage"] = usage
+                future = executor.submit(
                     self.run_success_logging_and_cache_storage,
                     processed_chunk,
                     cache_hit,
-                )  # log response
+                )
+                self._track_future(future)
+                self._register_recent_content(processed_chunk)
                 return processed_chunk
         except Exception as e:
             traceback_exception = traceback.format_exc()
@@ -1789,16 +1833,11 @@ class CustomStreamWrapper:
                         self.logging_obj._update_completion_start_time(
                             completion_start_time=datetime.datetime.now()
                         )
-
-                    choice = processed_chunk.choices[0]
-                    if isinstance(choice, StreamingChoices):
-                        self.response_uptil_now += choice.delta.get("content", "") or ""
-                    else:
-                        self.response_uptil_now += ""
+                    self.accumulator.update(processed_chunk)
+                    aggregated_content = self.accumulator.get_accumulated_content()
                     self.rules.post_call_rules(
-                        input=self.response_uptil_now, model=self.model
+                        input=aggregated_content or None, model=self.model
                     )
-                    self.chunks.append(processed_chunk)
                     if hasattr(
                         processed_chunk, "usage"
                     ):  # remove usage from chunk, only send on final chunk
@@ -1821,8 +1860,9 @@ class CustomStreamWrapper:
 
                     # add usage as hidden param
                     if self.sent_last_chunk is True and self.stream_options is None:
-                        usage = calculate_total_usage(chunks=self.chunks)
-                        processed_chunk._hidden_params["usage"] = usage
+                        usage = self.accumulator.current_usage()
+                        if usage is not None:
+                            processed_chunk._hidden_params["usage"] = usage
                     return processed_chunk
                 raise StopAsyncIteration
             else:  # temporary patch for non-aiohttp async calls
@@ -1845,28 +1885,21 @@ class CustomStreamWrapper:
                         if processed_chunk is None:
                             continue
 
-                        choice = processed_chunk.choices[0]
-                        if isinstance(choice, StreamingChoices):
-                            self.response_uptil_now += (
-                                choice.delta.get("content", "") or ""
-                            )
-                        else:
-                            self.response_uptil_now += ""
+                        self.accumulator.update(processed_chunk)
+                        aggregated_content = (
+                            self.accumulator.get_accumulated_content()
+                        )
                         self.rules.post_call_rules(
-                            input=self.response_uptil_now, model=self.model
+                            input=aggregated_content or None, model=self.model
                         )
                         # RETURN RESULT
-                        self.chunks.append(processed_chunk)
                         return processed_chunk
         except (StopAsyncIteration, StopIteration):
             if self.sent_last_chunk is True:
-                # log the final chunk with accurate streaming values
-                complete_streaming_response = litellm.stream_chunk_builder(
-                    chunks=self.chunks,
+                complete_streaming_response = self.accumulator.finalize(
                     messages=self.messages,
                     logging_obj=self.logging_obj,
                 )
-
                 response = self.model_response_creator()
                 if complete_streaming_response is not None:
                     setattr(
@@ -1874,19 +1907,18 @@ class CustomStreamWrapper:
                         "usage",
                         getattr(complete_streaming_response, "usage"),
                     )
-                    asyncio.create_task(
+                    cache_task = asyncio.create_task(
                         self.async_cache_streaming_response(
-                            processed_chunk=complete_streaming_response.model_copy(
-                                deep=True
-                            ),
+                            processed_chunk=complete_streaming_response,
                             cache_hit=cache_hit,
                         )
                     )
+                    self._track_task(cache_task)
                 if self.sent_stream_usage is False and self.send_stream_usage is True:
                     self.sent_stream_usage = True
                     return response
 
-                asyncio.create_task(
+                success_task = asyncio.create_task(
                     self.logging_obj.async_success_handler(
                         complete_streaming_response,
                         cache_hit=cache_hit,
@@ -1894,19 +1926,24 @@ class CustomStreamWrapper:
                         end_time=None,
                     )
                 )
+                self._track_task(success_task)
 
-                executor.submit(
+                future = executor.submit(
                     self.logging_obj.success_handler,
                     complete_streaming_response,
                     cache_hit=cache_hit,
                     start_time=None,
                     end_time=None,
                 )
+                self._track_future(future)
+
+                self._recent_contents.clear()
 
                 raise StopAsyncIteration  # Re-raise StopIteration
             else:
                 self.sent_last_chunk = True
                 processed_chunk = self.finish_reason_handler()
+                self.accumulator.update(processed_chunk)
                 return processed_chunk
         except httpx.TimeoutException as e:  # if httpx read timeout error occues
             traceback_exception = traceback.format_exc()
@@ -1921,9 +1958,10 @@ class CustomStreamWrapper:
                     args=(e, traceback_exception),
                 ).start()  # log response
                 # Handle any exceptions that might occur during streaming
-                asyncio.create_task(
+                failure_task = asyncio.create_task(
                     self.logging_obj.async_failure_handler(e, traceback_exception)
                 )
+                self._track_task(failure_task)
             raise e
         except Exception as e:
             traceback_exception = traceback.format_exc()
@@ -1934,9 +1972,10 @@ class CustomStreamWrapper:
                     args=(e, traceback_exception),
                 ).start()  # log response
                 # Handle any exceptions that might occur during streaming
-                asyncio.create_task(
+                failure_task = asyncio.create_task(
                     self.logging_obj.async_failure_handler(e, traceback_exception)  # type: ignore
                 )
+                self._track_task(failure_task)
             ## Map to OpenAI Exception
             try:
                 raise exception_type(
@@ -1954,7 +1993,7 @@ class CustomStreamWrapper:
                     model=self.model,
                     llm_provider=self.custom_llm_provider or "anthropic",
                     original_exception=e,
-                    generated_content=self.response_uptil_now,
+                    generated_content=self.accumulator.get_accumulated_content(),
                     is_pre_first_chunk=not self.sent_first_chunk,
                 )
 
@@ -1993,26 +2032,6 @@ class CustomStreamWrapper:
                 return chunk[_length_of_sse_data_prefix:]
 
         return chunk
-
-
-def calculate_total_usage(chunks: List[ModelResponse]) -> Usage:
-    """Assume most recent usage chunk has total usage uptil then."""
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    for chunk in chunks:
-        if "usage" in chunk:
-            if "prompt_tokens" in chunk["usage"]:
-                prompt_tokens = chunk["usage"].get("prompt_tokens", 0) or 0
-            if "completion_tokens" in chunk["usage"]:
-                completion_tokens = chunk["usage"].get("completion_tokens", 0) or 0
-
-    returned_usage_chunk = Usage(
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        total_tokens=prompt_tokens + completion_tokens,
-    )
-
-    return returned_usage_chunk
 
 
 def generic_chunk_has_all_required_fields(chunk: dict) -> bool:

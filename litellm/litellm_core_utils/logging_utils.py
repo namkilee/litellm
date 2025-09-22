@@ -2,9 +2,10 @@ import asyncio
 import functools
 import time
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from litellm._logging import verbose_logger
+from litellm.litellm_core_utils.streaming_accumulator import StreamingAccumulator
 from litellm.types.utils import (
     ModelResponse,
     ModelResponseStream,
@@ -35,17 +36,6 @@ Helper utils used for logging callbacks
 
 # Global service logger instance to avoid recreating it
 _service_logger = None
-
-
-def _get_service_logger():
-    """Get or create the global ServiceLogging instance"""
-    global _service_logger
-    if _service_logger is None:
-        from litellm._service_logger import ServiceLogging
-
-        _service_logger = ServiceLogging()
-    return _service_logger
-
 
 def _get_parent_otel_span_from_logging_obj(
     logging_obj: Optional[LiteLLMLoggingObject] = None,
@@ -100,7 +90,7 @@ def _assemble_complete_response_from_streaming_chunks(
     start_time: datetime,
     end_time: datetime,
     request_kwargs: dict,
-    streaming_chunks: List[Any],
+    accumulator: StreamingAccumulator,
     is_async: bool,
 ):
     """
@@ -129,11 +119,14 @@ def _assemble_complete_response_from_streaming_chunks(
     if isinstance(result, ModelResponse):
         return result
 
+    accumulator.update(result)
+
+    if not isinstance(result, ModelResponseStream):
+        return None
+
     if result.choices[0].finish_reason is not None:  # if it's the last chunk
-        streaming_chunks.append(result)
         try:
-            complete_streaming_response = litellm.stream_chunk_builder(
-                chunks=streaming_chunks,
+            complete_streaming_response = accumulator.finalize(
                 messages=request_kwargs.get("messages", None),
                 start_time=start_time,
                 end_time=end_time,
@@ -146,8 +139,6 @@ def _assemble_complete_response_from_streaming_chunks(
             )
             verbose_logger.exception(log_message)
             complete_streaming_response = None
-    else:
-        streaming_chunks.append(result)
     return complete_streaming_response
 
 
