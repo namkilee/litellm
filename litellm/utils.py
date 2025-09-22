@@ -841,6 +841,9 @@ async def _client_async_logging_helper(
         ################################################
         from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
 
+        if hasattr(logging_obj, "mark_async_success_pending"):
+            logging_obj.mark_async_success_pending()
+
         GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(
             async_coroutine=logging_obj.async_success_handler(
                 result=result, start_time=start_time, end_time=end_time

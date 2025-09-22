@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 import traceback
+from threading import Lock
 from datetime import datetime as dt_object
 from functools import lru_cache
 from typing import (
@@ -305,6 +306,13 @@ class Logging(LiteLLMLoggingBaseClass):
         self.streaming_chunks = self.streaming_accumulator
         self.sync_streaming_chunks = self.sync_streaming_accumulator
         self.log_raw_request_response = log_raw_request_response
+
+        # Tracking state for safe cleanup of streaming payloads
+        self._streaming_prune_lock: Lock = Lock()
+        self._streaming_payloads_pruned: bool = False
+        self._streaming_sync_completed: bool = False
+        self._streaming_async_expected: bool = False
+        self._streaming_async_completed: bool = False
 
         # Initialize dynamic callbacks
         self.dynamic_input_callbacks: Optional[
@@ -1149,6 +1157,72 @@ class Logging(LiteLLMLoggingBaseClass):
             return None
         self.model_call_details["response_cost"] = response.hidden_params.response_cost
         return response.mcp_tool_call_response
+
+    def mark_async_success_pending(self) -> None:
+        """Mark that async success logging is expected for this streaming call."""
+
+        if not self.stream:
+            return
+
+        with self._streaming_prune_lock:
+            self._streaming_async_expected = True
+            self._streaming_async_completed = False
+
+    def _mark_async_handler_started(self) -> None:
+        if not self.stream:
+            return
+
+        with self._streaming_prune_lock:
+            if not self._streaming_async_expected:
+                self._streaming_async_expected = True
+            self._streaming_async_completed = False
+
+    def _mark_streaming_handler_complete(self, handler: Literal["sync", "async"]) -> None:
+        if not self.stream:
+            return
+
+        with self._streaming_prune_lock:
+            if handler == "sync":
+                self._streaming_sync_completed = True
+            elif handler == "async":
+                self._streaming_async_completed = True
+            self._prune_streaming_payloads_locked()
+
+    def _prune_streaming_payloads_locked(self) -> None:
+        if self._streaming_payloads_pruned:
+            return
+
+        if not self._streaming_sync_completed:
+            return
+
+        if self._streaming_async_expected and not self._streaming_async_completed:
+            return
+
+        for key in (
+            "complete_streaming_response",
+            "async_complete_streaming_response",
+            "complete_response",
+        ):
+            self.model_call_details.pop(key, None)
+
+        try:
+            self.streaming_accumulator.clear()
+        except Exception:
+            pass
+
+        try:
+            self.sync_streaming_accumulator.clear()
+        except Exception:
+            pass
+
+        self._streaming_payloads_pruned = True
+
+    def _prune_streaming_payloads(self) -> None:
+        if not self.stream:
+            return
+
+        with self._streaming_prune_lock:
+            self._prune_streaming_payloads_locked()
 
     def get_response_ms(self) -> float:
         return (
@@ -2098,6 +2172,8 @@ class Logging(LiteLLMLoggingBaseClass):
                     str(e)
                 ),
             )
+        finally:
+            self._mark_streaming_handler_complete(handler="sync")
 
     async def async_success_handler(  # noqa: PLR0915
         self, result=None, start_time=None, end_time=None, cache_hit=None, **kwargs
@@ -2108,296 +2184,301 @@ class Logging(LiteLLMLoggingBaseClass):
         print_verbose(
             "Logging Details LiteLLM-Async Success Call, cache_hit={}".format(cache_hit)
         )
+        self._mark_async_handler_started()
         if not self.should_run_logging(
             event_type="async_success"
         ):  # prevent double logging
+            self._mark_streaming_handler_complete(handler="async")
             return
 
-        ## CALCULATE COST FOR BATCH JOBS
-        if self.call_type == CallTypes.aretrieve_batch.value and isinstance(
-            result, LiteLLMBatch
-        ):
-            litellm_params = self.litellm_params or {}
-            litellm_metadata = litellm_params.get("litellm_metadata", {})
-            if (
-                litellm_metadata.get("batch_ignore_default_logging", False) is True
-            ):  # polling job will query these frequently, don't spam db logs
-                return
+        try:
+            ## CALCULATE COST FOR BATCH JOBS
+            if self.call_type == CallTypes.aretrieve_batch.value and isinstance(
+                result, LiteLLMBatch
+            ):
+                litellm_params = self.litellm_params or {}
+                litellm_metadata = litellm_params.get("litellm_metadata", {})
+                if (
+                    litellm_metadata.get("batch_ignore_default_logging", False) is True
+                ):  # polling job will query these frequently, don't spam db logs
+                    return
 
-            from litellm.proxy.openai_files_endpoints.common_utils import (
-                _is_base64_encoded_unified_file_id,
-            )
-
-            # check if file id is a unified file id
-            is_base64_unified_file_id = _is_base64_encoded_unified_file_id(result.id)
-
-            batch_cost = kwargs.get("batch_cost", None)
-            batch_usage = kwargs.get("batch_usage", None)
-            batch_models = kwargs.get("batch_models", None)
-            if all([batch_cost, batch_usage, batch_models]) is not None:
-                result._hidden_params["response_cost"] = batch_cost
-                result._hidden_params["batch_models"] = batch_models
-                result.usage = batch_usage
-
-            elif not is_base64_unified_file_id:  # only run for non-unified file ids
-                (
-                    response_cost,
-                    batch_usage,
-                    batch_models,
-                ) = await _handle_completed_batch(
-                    batch=result, custom_llm_provider=self.custom_llm_provider
+                from litellm.proxy.openai_files_endpoints.common_utils import (
+                    _is_base64_encoded_unified_file_id,
                 )
 
-                result._hidden_params["response_cost"] = response_cost
-                result._hidden_params["batch_models"] = batch_models
-                result.usage = batch_usage
+                # check if file id is a unified file id
+                is_base64_unified_file_id = _is_base64_encoded_unified_file_id(result.id)
 
-        start_time, end_time, result = self._success_handler_helper_fn(
-            start_time=start_time,
-            end_time=end_time,
-            result=result,
-            cache_hit=cache_hit,
-            standard_logging_object=kwargs.get("standard_logging_object", None),
-        )
+                batch_cost = kwargs.get("batch_cost", None)
+                batch_usage = kwargs.get("batch_usage", None)
+                batch_models = kwargs.get("batch_models", None)
+                if all([batch_cost, batch_usage, batch_models]) is not None:
+                    result._hidden_params["response_cost"] = batch_cost
+                    result._hidden_params["batch_models"] = batch_models
+                    result.usage = batch_usage
 
-        ## BUILD COMPLETE STREAMED RESPONSE
-        if "async_complete_streaming_response" in self.model_call_details:
-            return  # break out of this.
-        complete_streaming_response: Optional[
-            Union[ModelResponse, TextCompletionResponse, ResponsesAPIResponse]
-        ] = self._get_assembled_streaming_response(
-            result=result,
-            start_time=start_time,
-            end_time=end_time,
-            is_async=True,
-            accumulator=self.streaming_accumulator,
-        )
-
-        if complete_streaming_response is not None:
-            print_verbose("Async success callbacks: Got a complete streaming response")
-
-            self.model_call_details[
-                "async_complete_streaming_response"
-            ] = complete_streaming_response
-
-            try:
-                if self.model_call_details.get("cache_hit", False) is True:
-                    self.model_call_details["response_cost"] = 0.0
-                else:
-                    # check if base_model set on azure
-                    _get_base_model_from_metadata(
-                        model_call_details=self.model_call_details
-                    )
-                    # base_model defaults to None if not set on model_info
-                    self.model_call_details[
-                        "response_cost"
-                    ] = self._response_cost_calculator(
-                        result=complete_streaming_response
+                elif not is_base64_unified_file_id:  # only run for non-unified file ids
+                    (
+                        response_cost,
+                        batch_usage,
+                        batch_models,
+                    ) = await _handle_completed_batch(
+                        batch=result, custom_llm_provider=self.custom_llm_provider
                     )
 
-                verbose_logger.debug(
-                    f"Model={self.model}; cost={self.model_call_details['response_cost']}"
-                )
-            except litellm.NotFoundError:
-                verbose_logger.warning(
-                    f"Model={self.model} not found in completion cost map. Setting 'response_cost' to None"
-                )
-                self.model_call_details["response_cost"] = None
+                    result._hidden_params["response_cost"] = response_cost
+                    result._hidden_params["batch_models"] = batch_models
+                    result.usage = batch_usage
 
-            ## STANDARDIZED LOGGING PAYLOAD
-            self.model_call_details[
-                "standard_logging_object"
-            ] = get_standard_logging_object_payload(
-                kwargs=self.model_call_details,
-                init_response_obj=complete_streaming_response,
+            start_time, end_time, result = self._success_handler_helper_fn(
                 start_time=start_time,
                 end_time=end_time,
-                logging_obj=self,
-                status="success",
-                standard_built_in_tools_params=self.standard_built_in_tools_params,
+                result=result,
+                cache_hit=cache_hit,
+                standard_logging_object=kwargs.get("standard_logging_object", None),
             )
-        callbacks = self.get_combined_callback_list(
-            dynamic_success_callbacks=self.dynamic_async_success_callbacks,
-            global_callbacks=litellm._async_success_callback,
-        )
 
-        result = redact_message_input_output_from_logging(
-            model_call_details=(
-                self.model_call_details if hasattr(self, "model_call_details") else {}
-            ),
-            result=result,
-        )
+            ## BUILD COMPLETE STREAMED RESPONSE
+            if "async_complete_streaming_response" in self.model_call_details:
+                return  # break out of this.
+            complete_streaming_response: Optional[
+                Union[ModelResponse, TextCompletionResponse, ResponsesAPIResponse]
+            ] = self._get_assembled_streaming_response(
+                result=result,
+                start_time=start_time,
+                end_time=end_time,
+                is_async=True,
+                accumulator=self.streaming_accumulator,
+            )
 
-        ## LOGGING HOOK ##
+            if complete_streaming_response is not None:
+                print_verbose("Async success callbacks: Got a complete streaming response")
 
-        for callback in callbacks:
-            if isinstance(callback, CustomGuardrail):
-                from litellm.types.guardrails import GuardrailEventHooks
+                self.model_call_details[
+                    "async_complete_streaming_response"
+                ] = complete_streaming_response
 
-                if (
-                    callback.should_run_guardrail(
-                        data=self.model_call_details,
-                        event_type=GuardrailEventHooks.logging_only,
+                try:
+                    if self.model_call_details.get("cache_hit", False) is True:
+                        self.model_call_details["response_cost"] = 0.0
+                    else:
+                        # check if base_model set on azure
+                        _get_base_model_from_metadata(
+                            model_call_details=self.model_call_details
+                        )
+                        # base_model defaults to None if not set on model_info
+                        self.model_call_details[
+                            "response_cost"
+                        ] = self._response_cost_calculator(
+                            result=complete_streaming_response
+                        )
+
+                    verbose_logger.debug(
+                        f"Model={self.model}; cost={self.model_call_details['response_cost']}"
                     )
-                    is not True
-                ):
-                    continue
+                except litellm.NotFoundError:
+                    verbose_logger.warning(
+                        f"Model={self.model} not found in completion cost map. Setting 'response_cost' to None"
+                    )
+                    self.model_call_details["response_cost"] = None
 
-                self.model_call_details, result = await callback.async_logging_hook(
+                ## STANDARDIZED LOGGING PAYLOAD
+                self.model_call_details[
+                    "standard_logging_object"
+                ] = get_standard_logging_object_payload(
                     kwargs=self.model_call_details,
-                    result=result,
-                    call_type=self.call_type,
+                    init_response_obj=complete_streaming_response,
+                    start_time=start_time,
+                    end_time=end_time,
+                    logging_obj=self,
+                    status="success",
+                    standard_built_in_tools_params=self.standard_built_in_tools_params,
                 )
-            elif isinstance(callback, CustomLogger):
-                result = redact_message_input_output_from_custom_logger(
-                    result=result, litellm_logging_obj=self, custom_logger=callback
-                )
-                self.model_call_details, result = await callback.async_logging_hook(
-                    kwargs=self.model_call_details,
-                    result=result,
-                    call_type=self.call_type,
-                )
-
-        self.has_run_logging(event_type="async_success")
-
-        for callback in callbacks:
-            # check if callback can run for this request
-            litellm_params = self.model_call_details.get("litellm_params", {})
-            should_run = self.should_run_callback(
-                callback=callback,
-                litellm_params=litellm_params,
-                event_hook="async_success_handler",
+            callbacks = self.get_combined_callback_list(
+                dynamic_success_callbacks=self.dynamic_async_success_callbacks,
+                global_callbacks=litellm._async_success_callback,
             )
-            if not should_run:
-                continue
-            try:
-                if callback == "openmeter" and openMeterLogger is not None:
-                    if self.stream is True:
-                        if (
-                            "async_complete_streaming_response"
-                            in self.model_call_details
-                        ):
+
+            result = redact_message_input_output_from_logging(
+                model_call_details=(
+                    self.model_call_details if hasattr(self, "model_call_details") else {}
+                ),
+                result=result,
+            )
+
+            ## LOGGING HOOK ##
+
+            for callback in callbacks:
+                if isinstance(callback, CustomGuardrail):
+                    from litellm.types.guardrails import GuardrailEventHooks
+
+                    if (
+                        callback.should_run_guardrail(
+                            data=self.model_call_details,
+                            event_type=GuardrailEventHooks.logging_only,
+                        )
+                        is not True
+                    ):
+                        continue
+
+                    self.model_call_details, result = await callback.async_logging_hook(
+                        kwargs=self.model_call_details,
+                        result=result,
+                        call_type=self.call_type,
+                    )
+                elif isinstance(callback, CustomLogger):
+                    result = redact_message_input_output_from_custom_logger(
+                        result=result, litellm_logging_obj=self, custom_logger=callback
+                    )
+                    self.model_call_details, result = await callback.async_logging_hook(
+                        kwargs=self.model_call_details,
+                        result=result,
+                        call_type=self.call_type,
+                    )
+
+            self.has_run_logging(event_type="async_success")
+
+            for callback in callbacks:
+                # check if callback can run for this request
+                litellm_params = self.model_call_details.get("litellm_params", {})
+                should_run = self.should_run_callback(
+                    callback=callback,
+                    litellm_params=litellm_params,
+                    event_hook="async_success_handler",
+                )
+                if not should_run:
+                    continue
+                try:
+                    if callback == "openmeter" and openMeterLogger is not None:
+                        if self.stream is True:
+                            if (
+                                "async_complete_streaming_response"
+                                in self.model_call_details
+                            ):
+                                await openMeterLogger.async_log_success_event(
+                                    kwargs=self.model_call_details,
+                                    response_obj=self.model_call_details[
+                                        "async_complete_streaming_response"
+                                    ],
+                                    start_time=start_time,
+                                    end_time=end_time,
+                                )
+                            else:
+                                await openMeterLogger.async_log_stream_event(  # [TODO]: move this to being an async log stream event function
+                                    kwargs=self.model_call_details,
+                                    response_obj=result,
+                                    start_time=start_time,
+                                    end_time=end_time,
+                                )
+                        else:
                             await openMeterLogger.async_log_success_event(
                                 kwargs=self.model_call_details,
-                                response_obj=self.model_call_details[
-                                    "async_complete_streaming_response"
-                                ],
-                                start_time=start_time,
-                                end_time=end_time,
-                            )
-                        else:
-                            await openMeterLogger.async_log_stream_event(  # [TODO]: move this to being an async log stream event function
-                                kwargs=self.model_call_details,
                                 response_obj=result,
                                 start_time=start_time,
                                 end_time=end_time,
                             )
-                    else:
-                        await openMeterLogger.async_log_success_event(
-                            kwargs=self.model_call_details,
-                            response_obj=result,
-                            start_time=start_time,
-                            end_time=end_time,
-                        )
 
-                if isinstance(callback, CustomLogger):  # custom logger class
-                    model_call_details: Dict = self.model_call_details
-                    ##################################
-                    # call redaction hook for custom logger
-                    model_call_details = callback.redact_standard_logging_payload_from_model_call_details(
-                        model_call_details=model_call_details
-                    )
-                    ##################################
-                    if self.stream is True:
-                        if "async_complete_streaming_response" in model_call_details:
+                    if isinstance(callback, CustomLogger):  # custom logger class
+                        model_call_details: Dict = self.model_call_details
+                        ##################################
+                        # call redaction hook for custom logger
+                        model_call_details = callback.redact_standard_logging_payload_from_model_call_details(
+                            model_call_details=model_call_details
+                        )
+                        ##################################
+                        if self.stream is True:
+                            if "async_complete_streaming_response" in model_call_details:
+                                await callback.async_log_success_event(
+                                    kwargs=model_call_details,
+                                    response_obj=model_call_details[
+                                        "async_complete_streaming_response"
+                                    ],
+                                    start_time=start_time,
+                                    end_time=end_time,
+                                )
+                            else:
+                                await callback.async_log_stream_event(  # [TODO]: move this to being an async log stream event function
+                                    kwargs=model_call_details,
+                                    response_obj=result,
+                                    start_time=start_time,
+                                    end_time=end_time,
+                                )
+                        else:
                             await callback.async_log_success_event(
                                 kwargs=model_call_details,
-                                response_obj=model_call_details[
-                                    "async_complete_streaming_response"
-                                ],
-                                start_time=start_time,
-                                end_time=end_time,
-                            )
-                        else:
-                            await callback.async_log_stream_event(  # [TODO]: move this to being an async log stream event function
-                                kwargs=model_call_details,
                                 response_obj=result,
                                 start_time=start_time,
                                 end_time=end_time,
                             )
-                    else:
-                        await callback.async_log_success_event(
-                            kwargs=model_call_details,
-                            response_obj=result,
-                            start_time=start_time,
-                            end_time=end_time,
-                        )
-                if callable(callback):  # custom logger functions
-                    global customLogger
-                    if customLogger is None:
-                        customLogger = CustomLogger()
-                    if self.stream:
-                        if (
-                            "async_complete_streaming_response"
-                            in self.model_call_details
-                        ):
+                    if callable(callback):  # custom logger functions
+                        global customLogger
+                        if customLogger is None:
+                            customLogger = CustomLogger()
+                        if self.stream:
+                            if (
+                                "async_complete_streaming_response"
+                                in self.model_call_details
+                            ):
+                                await customLogger.async_log_event(
+                                    kwargs=self.model_call_details,
+                                    response_obj=self.model_call_details[
+                                        "async_complete_streaming_response"
+                                    ],
+                                    start_time=start_time,
+                                    end_time=end_time,
+                                    print_verbose=print_verbose,
+                                    callback_func=callback,
+                                )
+                        else:
                             await customLogger.async_log_event(
                                 kwargs=self.model_call_details,
-                                response_obj=self.model_call_details[
-                                    "async_complete_streaming_response"
-                                ],
+                                response_obj=result,
                                 start_time=start_time,
                                 end_time=end_time,
                                 print_verbose=print_verbose,
                                 callback_func=callback,
                             )
-                    else:
-                        await customLogger.async_log_event(
-                            kwargs=self.model_call_details,
-                            response_obj=result,
-                            start_time=start_time,
-                            end_time=end_time,
-                            print_verbose=print_verbose,
-                            callback_func=callback,
-                        )
-                if callback == "dynamodb":
-                    global dynamoLogger
-                    if dynamoLogger is None:
-                        dynamoLogger = DyanmoDBLogger()
-                    if self.stream:
-                        if (
-                            "async_complete_streaming_response"
-                            in self.model_call_details
-                        ):
-                            print_verbose(
-                                "DynamoDB Logger: Got Stream Event - Completed Stream Response"
-                            )
+                    if callback == "dynamodb":
+                        global dynamoLogger
+                        if dynamoLogger is None:
+                            dynamoLogger = DyanmoDBLogger()
+                        if self.stream:
+                            if (
+                                "async_complete_streaming_response"
+                                in self.model_call_details
+                            ):
+                                print_verbose(
+                                    "DynamoDB Logger: Got Stream Event - Completed Stream Response"
+                                )
+                                await dynamoLogger._async_log_event(
+                                    kwargs=self.model_call_details,
+                                    response_obj=self.model_call_details[
+                                        "async_complete_streaming_response"
+                                    ],
+                                    start_time=start_time,
+                                    end_time=end_time,
+                                    print_verbose=print_verbose,
+                                )
+                            else:
+                                print_verbose(
+                                    "DynamoDB Logger: Got Stream Event - No complete stream response as yet"
+                                )
+                        else:
                             await dynamoLogger._async_log_event(
                                 kwargs=self.model_call_details,
-                                response_obj=self.model_call_details[
-                                    "async_complete_streaming_response"
-                                ],
+                                response_obj=result,
                                 start_time=start_time,
                                 end_time=end_time,
                                 print_verbose=print_verbose,
                             )
-                        else:
-                            print_verbose(
-                                "DynamoDB Logger: Got Stream Event - No complete stream response as yet"
-                            )
-                    else:
-                        await dynamoLogger._async_log_event(
-                            kwargs=self.model_call_details,
-                            response_obj=result,
-                            start_time=start_time,
-                            end_time=end_time,
-                            print_verbose=print_verbose,
-                        )
-            except Exception:
-                verbose_logger.error(
-                    f"LiteLLM.LoggingError: [Non-Blocking] Exception occurred while success logging {traceback.format_exc()}"
-                )
-                pass
+                except Exception:
+                    verbose_logger.error(
+                        f"LiteLLM.LoggingError: [Non-Blocking] Exception occurred while success logging {traceback.format_exc()}"
+                    )
+                    pass
+        finally:
+            self._mark_streaming_handler_complete(handler="async")
 
     def _failure_handler_helper_fn(
         self, exception, traceback_exception, start_time=None, end_time=None
