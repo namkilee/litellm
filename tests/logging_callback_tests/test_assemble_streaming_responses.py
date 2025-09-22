@@ -8,22 +8,39 @@ Testing for _assemble_complete_response_from_streaming_chunks
 
 """
 
-import json
+import asyncio
+import importlib.util
 import os
 import sys
 from datetime import datetime
-from unittest.mock import AsyncMock
 
-sys.path.insert(
-    0, os.path.abspath("../..")
-)  # Adds the parent directory to the system path
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, "../.."))
+sys.path.insert(0, ROOT_DIR)  # Adds the parent directory to the system path
+
+for _module_name in list(sys.modules):
+    if _module_name.startswith("litellm"):
+        del sys.modules[_module_name]
+
+spec = importlib.util.spec_from_file_location(
+    "litellm",
+    os.path.join(ROOT_DIR, "litellm/__init__.py"),
+    submodule_search_locations=[os.path.join(ROOT_DIR, "litellm")],
+)
+_litellm_module = importlib.util.module_from_spec(spec)
+sys.modules["litellm"] = _litellm_module
+assert spec.loader is not None
+spec.loader.exec_module(_litellm_module)
+
+try:
+    import respx  # noqa: F401
+
+    RESPX_AVAILABLE = True
+except ModuleNotFoundError:
+    RESPX_AVAILABLE = False
 
 
-import httpx
 import pytest
-
-pytest.importorskip("respx")
-from respx import MockRouter
 
 import litellm
 from litellm import (
@@ -38,9 +55,14 @@ from litellm import (
 from litellm.litellm_core_utils.logging_utils import (
     _assemble_complete_response_from_streaming_chunks,
 )
+from litellm.litellm_core_utils.litellm_logging import Logging
 from litellm.litellm_core_utils.streaming_accumulator import StreamingAccumulator
+from litellm.types.utils import CallTypes
 
 
+@pytest.mark.skipif(
+    not RESPX_AVAILABLE, reason="respx is required for streaming assembly tests"
+)
 @pytest.mark.parametrize("is_async", [True, False])
 def test_assemble_complete_response_from_streaming_chunks_1(is_async):
     """
@@ -135,6 +157,9 @@ def test_assemble_complete_response_from_streaming_chunks_1(is_async):
     pass
 
 
+@pytest.mark.skipif(
+    not RESPX_AVAILABLE, reason="respx is required for streaming assembly tests"
+)
 @pytest.mark.parametrize("is_async", [True, False])
 def test_assemble_complete_response_from_streaming_chunks_2(is_async):
     """
@@ -236,6 +261,9 @@ def test_assemble_complete_response_from_streaming_chunks_2(is_async):
     pass
 
 
+@pytest.mark.skipif(
+    not RESPX_AVAILABLE, reason="respx is required for streaming assembly tests"
+)
 @pytest.mark.parametrize("is_async", [True, False])
 def test_assemble_complete_response_from_streaming_chunks_3(is_async):
 
@@ -337,6 +365,9 @@ def test_assemble_complete_response_from_streaming_chunks_3(is_async):
     assert accumulator_2.has_data() is True
 
 
+@pytest.mark.skipif(
+    not RESPX_AVAILABLE, reason="respx is required for streaming assembly tests"
+)
 @pytest.mark.parametrize("is_async", [True, False])
 def test_assemble_complete_response_from_streaming_chunks_4(is_async):
     """
@@ -392,3 +423,79 @@ def test_assemble_complete_response_from_streaming_chunks_4(is_async):
     assert complete_streaming_response is None
 
     assert accumulator.has_data() is True
+
+
+def _build_streaming_model_response() -> ModelResponse:
+    return ModelResponse(
+        model="gpt-3.5-turbo",
+        choices=[
+            Choices(
+                index=0,
+                message=Message(role="assistant", content="streamed response"),
+                finish_reason="stop",
+                logprobs=None,
+            )
+        ],
+    )
+
+
+def _prepare_logging_obj(
+    *,
+    stream: bool,
+    call_type: str,
+) -> Logging:
+    logging_obj = Logging(
+        model="gpt-3.5-turbo",
+        messages=[{"role": "user", "content": "hi"}],
+        stream=stream,
+        call_type=call_type,
+        litellm_call_id="test-call-id",
+        function_id="test-function-id",
+        start_time=datetime.now(),
+    )
+    logging_obj.model_call_details.update(
+        {
+            "messages": logging_obj.messages,
+            "input": logging_obj.messages,
+            "stream": stream,
+            "call_type": call_type,
+            "optional_params": {},
+        }
+    )
+    return logging_obj
+
+
+def _assert_streaming_keys_pruned(logging_obj: Logging) -> None:
+    for key in (
+        "complete_streaming_response",
+        "async_complete_streaming_response",
+        "standard_logging_object",
+        "complete_response",
+    ):
+        assert key not in logging_obj.model_call_details
+
+
+def test_success_handler_prunes_streaming_payloads(monkeypatch):
+    monkeypatch.setattr(litellm, "success_callback", [])
+    logging_obj = _prepare_logging_obj(
+        stream=True, call_type=CallTypes.completion.value
+    )
+
+    response = _build_streaming_model_response()
+
+    logging_obj.success_handler(result=response)
+
+    _assert_streaming_keys_pruned(logging_obj)
+
+
+def test_async_success_handler_prunes_streaming_payloads(monkeypatch):
+    monkeypatch.setattr(litellm, "_async_success_callback", [])
+    logging_obj = _prepare_logging_obj(
+        stream=True, call_type=CallTypes.acompletion.value
+    )
+
+    response = _build_streaming_model_response()
+
+    asyncio.run(logging_obj.async_success_handler(result=response))
+
+    _assert_streaming_keys_pruned(logging_obj)
