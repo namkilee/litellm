@@ -742,17 +742,25 @@ class ProxyBaseLLMRequestProcessing:
                 verbose_proxy_logger.debug(
                     "async_data_generator: received streaming chunk - {}".format(chunk)
                 )
+                response_str: Optional[str] = None
+                updated_str: Optional[str] = None
+                if isinstance(chunk, (ModelResponse, ModelResponseStream)):
+                    response_str = litellm.get_response_string(response_obj=chunk)
+                    updated_str = str_so_far + response_str
                 ### CALL HOOKS ### - modify outgoing data
                 chunk = await proxy_logging_obj.async_post_call_streaming_hook(
                     user_api_key_dict=user_api_key_dict,
                     response=chunk,
                     data=request_data,
-                    str_so_far=str_so_far,
+                    str_so_far=updated_str if updated_str is not None else str_so_far,
                 )
 
-                if isinstance(chunk, (ModelResponse, ModelResponseStream)):
-                    response_str = litellm.get_response_string(response_obj=chunk)
-                    str_so_far += response_str
+                if (
+                    response_str is not None
+                    and isinstance(chunk, (ModelResponse, ModelResponseStream))
+                    and updated_str is not None
+                ):
+                    str_so_far = updated_str
 
                 # Format chunk using helper function
                 yield ProxyBaseLLMRequestProcessing.return_sse_chunk(chunk)

@@ -1488,7 +1488,7 @@ class ProxyLogging:
                         _callback = callback  # type: ignore
                     if _callback is not None and isinstance(_callback, CustomLogger):
                         if str_so_far is not None:
-                            complete_response = str_so_far + response_str
+                            complete_response = str_so_far
                         else:
                             complete_response = response_str
                         potential_error_response = (

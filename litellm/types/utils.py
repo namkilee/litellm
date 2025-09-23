@@ -30,7 +30,7 @@ from openai.types.moderation import (
 )
 from openai.types.moderation_create_response import Moderation, ModerationCreateResponse
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
-from typing_extensions import Callable, Dict, Required, TypedDict, override
+from typing_extensions import Callable, Dict, NotRequired, Required, TypedDict, override
 
 import litellm
 from litellm.types.llms.base import (
@@ -2055,6 +2055,8 @@ class StandardLoggingPayload(TypedDict):
     requester_ip_address: Optional[str]
     messages: Optional[Union[str, list, dict]]
     response: Optional[Union[str, list, dict]]
+    messages_truncated: NotRequired[bool]
+    response_truncated: NotRequired[bool]
     error_str: Optional[str]
     error_information: Optional[StandardLoggingPayloadErrorInformation]
     model_parameters: dict
